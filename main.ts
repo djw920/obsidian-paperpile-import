@@ -372,14 +372,15 @@ export default class PaperpileImportPlugin extends Plugin {
 			content += `**DOI:** [${entry.doi}](${doiUrl})\n\n`;
 		}
 		
-		// Notes section
-		content += '## 📓 Notes\n\n';
-		
-		// Add Paperpile notes
-		if (entry.paperpile_notes) {
-			content += '### Paperpile Notes\n\n';
-			content += `${entry.paperpile_notes}\n\n`;
-		}
+	// Notes section
+	content += '## 📓 Notes\n\n';
+	
+	// Add Paperpile notes
+	if (entry.paperpile_notes) {
+		content += '### Paperpile Notes\n\n';
+		content += this.formatPaperpileNotes(entry.paperpile_notes);
+		content += '\n\n';
+	}
 		
 		// Add user notes or placeholder
 		if (userNotes) {
@@ -398,6 +399,75 @@ export default class PaperpileImportPlugin extends Plugin {
 
 	escapeYaml(str: string): string {
 		return str.replace(/"/g, '\\"');
+	}
+
+	formatPaperpileNotes(notes: string): string {
+		if (!notes) return '';
+		
+		// Split into lines and process
+		const lines = notes.split('\n');
+		const formatted: string[] = [];
+		let inParagraph = false;
+		
+		for (let i = 0; i < lines.length; i++) {
+			let line = lines[i].trim();
+			
+			// Empty line - preserve as paragraph break
+			if (!line) {
+				if (inParagraph) {
+					formatted.push(''); // Add blank line
+					inParagraph = false;
+				}
+				continue;
+			}
+			
+			// Check if it's a heading (no quotes, title case, relatively short, not ending with period)
+			if (this.isHeadingLine(line)) {
+				if (inParagraph) formatted.push(''); // Add space before heading
+				formatted.push(`#### ${line}`);
+				formatted.push(''); // Add space after heading
+				inParagraph = false;
+			} 
+			// Check if it's a quote (starts with ")
+			else if (line.startsWith('"')) {
+				// It's a quote - format as blockquote
+				formatted.push(`> ${line}`);
+				inParagraph = false;
+			}
+			// Already a bullet point
+			else if (line.startsWith('-') || line.startsWith('•')) {
+				formatted.push(line);
+				inParagraph = false;
+			}
+			// Regular paragraph text
+			else {
+				formatted.push(line);
+				inParagraph = true;
+			}
+		}
+		
+		return formatted.join('\n');
+	}
+
+	isHeadingLine(line: string): boolean {
+		// Headings are typically:
+		// - Title Case (multiple capital letters)
+		// - Not starting with a quote
+		// - Not ending with a period
+		// - Relatively short (< 100 chars)
+		// - Have at least 2 capital letters
+		
+		if (line.startsWith('"')) return false; // Quotes aren't headings
+		if (line.endsWith('.') || line.endsWith(',')) return false; // Sentences aren't headings
+		if (line.length > 100) return false; // Too long
+		
+		const capitalCount = (line.match(/[A-Z]/g) || []).length;
+		if (capitalCount >= 2 && !line.includes('(')) {
+			// Has multiple capitals and no parentheses (citations have parens)
+			return true;
+		}
+		
+		return false;
 	}
 
 	async ensureFolder(folderPath: string) {

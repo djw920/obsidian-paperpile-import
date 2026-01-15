@@ -2503,9 +2503,8 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
     content += "## \u{1F4D3} Notes\n\n";
     if (entry.paperpile_notes) {
       content += "### Paperpile Notes\n\n";
-      content += `${entry.paperpile_notes}
-
-`;
+      content += this.formatPaperpileNotes(entry.paperpile_notes);
+      content += "\n\n";
     }
     if (userNotes) {
       if (entry.paperpile_notes) {
@@ -2523,6 +2522,53 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
   }
   escapeYaml(str) {
     return str.replace(/"/g, '\\"');
+  }
+  formatPaperpileNotes(notes) {
+    if (!notes)
+      return "";
+    const lines = notes.split("\n");
+    const formatted = [];
+    let inParagraph = false;
+    for (let i = 0; i < lines.length; i++) {
+      let line = lines[i].trim();
+      if (!line) {
+        if (inParagraph) {
+          formatted.push("");
+          inParagraph = false;
+        }
+        continue;
+      }
+      if (this.isHeadingLine(line)) {
+        if (inParagraph)
+          formatted.push("");
+        formatted.push(`#### ${line}`);
+        formatted.push("");
+        inParagraph = false;
+      } else if (line.startsWith('"')) {
+        formatted.push(`> ${line}`);
+        inParagraph = false;
+      } else if (line.startsWith("-") || line.startsWith("\u2022")) {
+        formatted.push(line);
+        inParagraph = false;
+      } else {
+        formatted.push(line);
+        inParagraph = true;
+      }
+    }
+    return formatted.join("\n");
+  }
+  isHeadingLine(line) {
+    if (line.startsWith('"'))
+      return false;
+    if (line.endsWith(".") || line.endsWith(","))
+      return false;
+    if (line.length > 100)
+      return false;
+    const capitalCount = (line.match(/[A-Z]/g) || []).length;
+    if (capitalCount >= 2 && !line.includes("(")) {
+      return true;
+    }
+    return false;
   }
   async ensureFolder(folderPath) {
     const folder = this.app.vault.getAbstractFileByPath(folderPath);
