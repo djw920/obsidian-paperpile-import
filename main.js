@@ -2250,6 +2250,8 @@ var DEFAULT_SETTINGS = {
   pdfFolder: "PDFs",
   paperpilePdfPath: ""
 };
+var IMPORT_BATCH_SIZE = 25;
+var MAX_PAPERPILE_NOTES_BYTES = 100 * 1024;
 var PaperpileImportPlugin = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
@@ -2287,38 +2289,104 @@ var PaperpileImportPlugin = class extends import_obsidian.Plugin {
     input.click();
   }
   async processBibtex(bibtext) {
-    var _a;
     const entries = bibtexParse.parse(bibtext);
     const archive = await this.loadArchive();
     let newCount = 0;
     let updatedCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
     const currentRefIds = /* @__PURE__ */ new Set();
+    let processed = 0;
     for (const entry of entries) {
+      processed++;
+      const rawKey = entry && entry.key ? String(entry.key).trim() : "";
+      if (!rawKey) {
+        skippedCount++;
+        console.warn("Paperpile import: skipping entry with empty key", entry);
+        continue;
+      }
+      const rawText = entry && typeof entry.raw === "string" ? entry.raw : "";
+      const rawHash = rawText ? await this.sha1(rawText) : "";
+      currentRefIds.add(rawKey);
+      const archived = archive[rawKey];
+      if (archived && rawHash && archived.hash === rawHash) {
+        if (processed % IMPORT_BATCH_SIZE === 0)
+          await this.yieldToEventLoop();
+        continue;
+      }
       const formattedEntry = this.formatBibEntry(entry);
-      const refId = formattedEntry.ref_id;
-      currentRefIds.add(refId);
-      if (archive[refId] && this.entriesAreEqual(archive[refId], formattedEntry)) {
+      if (!formattedEntry.ref_id) {
+        skippedCount++;
+        continue;
+      }
+      if (archived && this.entriesAreEqual(archived, formattedEntry)) {
+        if (rawHash && archived.hash !== rawHash)
+          archived.hash = rawHash;
+        if (processed % IMPORT_BATCH_SIZE === 0)
+          await this.yieldToEventLoop();
         continue;
       }
       try {
-        const userContent = await this.createOrUpdateFile(formattedEntry, ((_a = archive[refId]) == null ? void 0 : _a.notes) || "");
-        if (archive[refId]) {
+        const { userContent, path } = await this.createOrUpdateFile(
+          formattedEntry,
+          (archived == null ? void 0 : archived.notes) || ""
+        );
+        if (archived) {
           updatedCount++;
         } else {
           newCount++;
         }
-        archive[refId] = {
+        archive[rawKey] = {
           entry: formattedEntry,
-          notes: userContent
+          notes: userContent,
+          hash: rawHash,
+          path
         };
       } catch (error) {
-        console.error(`Error processing ${refId}:`, error);
+        errorCount++;
+        console.error(`Paperpile import: error processing ${rawKey}:`, error);
       }
+      if (processed % IMPORT_BATCH_SIZE === 0)
+        await this.yieldToEventLoop();
     }
     const movedCount = await this.cleanupRemovedPapers(currentRefIds, archive);
     await this.saveArchive(archive);
+    const summary = [
+      `New: ${newCount}`,
+      `Updated: ${updatedCount}`,
+      `Removed: ${movedCount}`,
+      `Skipped: ${skippedCount}`,
+      errorCount ? `Errors: ${errorCount}` : ""
+    ].filter(Boolean).join(" | ");
     new import_obsidian.Notice(`Import complete!
-New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
+${summary}`);
+  }
+  yieldToEventLoop() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  async sha1(input) {
+    var _a;
+    try {
+      const subtle = (_a = globalThis == null ? void 0 : globalThis.crypto) == null ? void 0 : _a.subtle;
+      if (subtle && typeof subtle.digest === "function") {
+        const buf = new TextEncoder().encode(input);
+        const hash = await subtle.digest("SHA-1", buf);
+        const bytes = new Uint8Array(hash);
+        let hex = "";
+        for (let i = 0; i < bytes.length; i++) {
+          hex += bytes[i].toString(16).padStart(2, "0");
+        }
+        return hex;
+      }
+    } catch (e) {
+      console.warn("Paperpile import: subtle.digest unavailable, falling back", e);
+    }
+    let h = 5381;
+    for (let i = 0; i < input.length; i++) {
+      h = (h << 5) + h ^ input.charCodeAt(i);
+      h = h | 0;
+    }
+    return "djb2:" + (h >>> 0).toString(16);
   }
   formatBibEntry(entry) {
     const refId = entry.key || "";
@@ -2357,28 +2425,39 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
     if (!s)
       return "";
     s = s.replace(/[{}]/g, "");
-    s = s.replace(/[^A-Za-z0-9\s&.,-;:/?()\"']+/g, "");
+    s = s.replace(/[^A-Za-z0-9\s&.,\-;:/?()\"']+/g, "");
     return s.trim().replace(/\s+/g, " ");
   }
   formatAuthors(authorString) {
     if (!authorString)
       return "";
-    authorString = authorString.replace(/ and /gi, "; ");
-    const authors = authorString.split(";").map((a) => a.trim());
+    authorString = authorString.replace(/\s+/g, " ").trim();
+    authorString = authorString.replace(/\s+and\s+/gi, "; ");
+    const authors = authorString.split(";").map((a) => a.trim()).filter(Boolean);
     const formatted = [];
     for (const author of authors) {
       if (author.includes(",")) {
-        const parts = author.split(",").map((p) => p.trim());
+        const parts = author.split(",").map((p) => p.trim()).filter(Boolean);
         if (parts.length >= 2) {
           formatted.push(`${parts[1]} ${parts[0]}`);
-        } else {
-          formatted.push(author);
+        } else if (parts.length === 1) {
+          formatted.push(parts[0]);
         }
       } else {
         formatted.push(author);
       }
     }
     return formatted.join(", ");
+  }
+  /**
+   * Sanitize an arbitrary string for safe inclusion as a YAML scalar.
+   * Collapses internal whitespace (newlines/tabs) and strips control
+   * characters that would break Obsidian's metadata cache parser.
+   */
+  sanitizeForYaml(s) {
+    if (!s)
+      return "";
+    return s.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
   }
   parsePaperpileFolders(keywords) {
     if (!keywords)
@@ -2424,7 +2503,7 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
     } else {
       await this.app.vault.create(filepath, content);
     }
-    return userNotes;
+    return { userContent: userNotes, path: filepath };
   }
   async extractUserNotes(file) {
     const content = await this.app.vault.read(file);
@@ -2439,42 +2518,43 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
     return "";
   }
   createMarkdownContent(entry, userNotes) {
+    const yaml = (v) => this.escapeYaml(this.sanitizeForYaml(v));
     let content = "---\n";
-    content += `title: "${this.escapeYaml(entry.title)}"
+    content += `title: "${yaml(entry.title)}"
 `;
     if (entry.authors) {
-      content += `authors: "${this.escapeYaml(entry.authors)}"
+      content += `authors: "${yaml(entry.authors)}"
 `;
     }
     if (entry.year) {
-      content += `year: ${entry.year}
+      content += `year: ${yaml(entry.year)}
 `;
     }
     if (entry.journal) {
-      content += `journal: "${this.escapeYaml(entry.journal)}"
+      content += `journal: "${yaml(entry.journal)}"
 `;
     }
     if (entry.booktitle) {
-      content += `conference: "${this.escapeYaml(entry.booktitle)}"
+      content += `conference: "${yaml(entry.booktitle)}"
 `;
     }
     if (entry.abstract) {
-      content += `abstract: "${this.escapeYaml(entry.abstract)}"
+      content += `abstract: "${yaml(entry.abstract)}"
 `;
     }
     if (entry.link) {
-      content += `url: "${entry.link}"
+      content += `url: "${yaml(entry.link)}"
 `;
     }
     if (entry.doi) {
-      content += `doi: "${entry.doi}"
+      content += `doi: "${yaml(entry.doi)}"
 `;
     }
     if (entry.pdf_path) {
-      content += `pdf: "${entry.pdf_path}"
+      content += `pdf: "${yaml(entry.pdf_path)}"
 `;
     }
-    content += `ref_id: "${entry.ref_id}"
+    content += `ref_id: "${yaml(entry.ref_id)}"
 `;
     if (entry.tags.length > 0) {
       content += "tags:\n";
@@ -2521,12 +2601,29 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
     return content;
   }
   escapeYaml(str) {
-    return str.replace(/"/g, '\\"');
+    return str.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\u0000-\u001F\u007F]/g, " ");
+  }
+  /**
+   * Strip the inline HTML that Paperpile sometimes embeds in the
+   * `annote` field. Without this, a single entry can ship tens of KB
+   * of `<p style="...">` tags which inflate every rendered DOM tree
+   * and contributed to the cppgc OOM that crashed the renderer.
+   */
+  stripHtml(input) {
+    if (!input)
+      return "";
+    return input.replace(/<\s*br\s*\/?\s*>/gi, "\n").replace(/<\s*\/(p|div|h[1-6]|li|tr|blockquote)\s*>/gi, "\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/[\u200B-\u200F\uFEFF]/g, "").replace(/\n{3,}/g, "\n\n");
   }
   formatPaperpileNotes(notes) {
     if (!notes)
       return "";
-    const lines = notes.split("\n");
+    let cleaned = this.stripHtml(notes);
+    if (cleaned.length > MAX_PAPERPILE_NOTES_BYTES) {
+      cleaned = cleaned.slice(0, MAX_PAPERPILE_NOTES_BYTES) + `
+
+_\u2026 (truncated by Paperpile import; original was ${cleaned.length.toLocaleString()} chars)_`;
+    }
+    const lines = cleaned.split("\n");
     const formatted = [];
     let inParagraph = false;
     for (let i = 0; i < lines.length; i++) {
@@ -2595,7 +2692,7 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
   }
   async saveArchive(archive) {
     const archivePath = this.settings.archiveFile;
-    const content = JSON.stringify(archive, null, 2);
+    const content = JSON.stringify(archive);
     const file = this.app.vault.getAbstractFileByPath(archivePath);
     if (file instanceof import_obsidian.TFile) {
       await this.app.vault.modify(file, content);
@@ -2607,22 +2704,39 @@ New: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
     var _a;
     const papersFolder = this.getPapersFolder();
     const removedFolder = `${papersFolder}/Removed Papers`;
-    await this.ensureFolder(removedFolder);
     let movedCount = 0;
+    let ensuredRemovedFolder = false;
     for (const refId in archive) {
-      if (!currentRefIds.has(refId)) {
+      if (currentRefIds.has(refId))
+        continue;
+      const record = archive[refId];
+      let file = null;
+      if (record == null ? void 0 : record.path) {
+        const maybe = this.app.vault.getAbstractFileByPath(record.path);
+        if (maybe instanceof import_obsidian.TFile)
+          file = maybe;
+      }
+      if (!file) {
         const filename = `${refId}.md`;
         const folder = this.app.vault.getAbstractFileByPath(papersFolder);
         if (folder instanceof import_obsidian.TFolder) {
-          const file = this.findFileRecursive(folder, filename);
-          if (file && ((_a = file.parent) == null ? void 0 : _a.path) !== removedFolder) {
-            const newPath = `${removedFolder}/${file.name}`;
-            await this.app.fileManager.renameFile(file, newPath);
-            movedCount++;
-          }
+          file = this.findFileRecursive(folder, filename);
         }
-        delete archive[refId];
       }
+      if (file && ((_a = file.parent) == null ? void 0 : _a.path) !== removedFolder) {
+        if (!ensuredRemovedFolder) {
+          await this.ensureFolder(removedFolder);
+          ensuredRemovedFolder = true;
+        }
+        try {
+          const newPath = `${removedFolder}/${file.name}`;
+          await this.app.fileManager.renameFile(file, newPath);
+          movedCount++;
+        } catch (e) {
+          console.error(`Paperpile import: failed to move ${refId}:`, e);
+        }
+      }
+      delete archive[refId];
     }
     return movedCount;
   }

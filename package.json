@@ -1,6 +1,6 @@
 {
   "name": "obsidian-paperpile-import",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Import Paperpile BibTeX files into Obsidian",
   "main": "main.js",
   "scripts": {

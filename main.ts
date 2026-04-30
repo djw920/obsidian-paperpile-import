@@ -48,12 +48,27 @@ interface FormattedEntry {
 	paperpile_notes: string;
 }
 
-interface Archive {
-	[ref_id: string]: {
-		entry: FormattedEntry;
-		notes: string;
-	};
+interface ArchiveRecord {
+	entry: FormattedEntry;
+	notes: string;
+	/** SHA-1 of the raw bib entry text, used for fast skip on re-import. */
+	hash?: string;
+	/** Path of the generated markdown file relative to the vault root. */
+	path?: string;
 }
+
+interface Archive {
+	[ref_id: string]: ArchiveRecord;
+}
+
+// Yield to the event loop after this many entries to keep the renderer
+// responsive and let other indexers (Dataview, Omnisearch, etc.) drain.
+const IMPORT_BATCH_SIZE = 25;
+
+// Hard cap on the size of the Paperpile-derived notes section to avoid
+// freak entries that ship megabytes of inline HTML and blow up the
+// renderer's cppgc heap when the file is rendered/indexed.
+const MAX_PAPERPILE_NOTES_BYTES = 100 * 1024;
 
 export default class PaperpileImportPlugin extends Plugin {
 	settings: PaperpileImportSettings;
@@ -105,53 +120,131 @@ export default class PaperpileImportPlugin extends Plugin {
 
 	async processBibtex(bibtext: string) {
 		const entries = bibtexParse.parse(bibtext);
-		
+
 		// Load archive
 		const archive = await this.loadArchive();
-		
+
 		// Track statistics
 		let newCount = 0;
 		let updatedCount = 0;
+		let skippedCount = 0;
+		let errorCount = 0;
 		const currentRefIds = new Set<string>();
 
-		// Process each entry
+		let processed = 0;
 		for (const entry of entries) {
-			const formattedEntry = this.formatBibEntry(entry);
-			const refId = formattedEntry.ref_id;
-			currentRefIds.add(refId);
+			processed++;
 
-			// Check if entry has changed
-			if (archive[refId] && this.entriesAreEqual(archive[refId], formattedEntry)) {
-				continue; // No changes
+			// Skip malformed entries with no key. Previously these wrote a
+			// hidden "<papersFolder>/.md" file that was overwritten on every
+			// run.
+			const rawKey = (entry && entry.key) ? String(entry.key).trim() : '';
+			if (!rawKey) {
+				skippedCount++;
+				console.warn('Paperpile import: skipping entry with empty key', entry);
+				continue;
 			}
 
-			// Create or update file
+			// Cheap pre-check using a SHA-1 of the raw bib text. If unchanged
+			// we can skip the expensive format/read/write path entirely.
+			const rawText: string = (entry && typeof entry.raw === 'string') ? entry.raw : '';
+			const rawHash = rawText ? await this.sha1(rawText) : '';
+			currentRefIds.add(rawKey);
+
+			const archived = archive[rawKey];
+			if (archived && rawHash && archived.hash === rawHash) {
+				// Periodically yield even on the fast path to keep the UI alive
+				// for very large bib files.
+				if (processed % IMPORT_BATCH_SIZE === 0) await this.yieldToEventLoop();
+				continue;
+			}
+
+			const formattedEntry = this.formatBibEntry(entry);
+			if (!formattedEntry.ref_id) {
+				skippedCount++;
+				continue;
+			}
+
+			if (archived && this.entriesAreEqual(archived, formattedEntry)) {
+				// Content equal but hash missing/old -> patch the hash so we
+				// stay on the fast path next time.
+				if (rawHash && archived.hash !== rawHash) archived.hash = rawHash;
+				if (processed % IMPORT_BATCH_SIZE === 0) await this.yieldToEventLoop();
+				continue;
+			}
+
 			try {
-				const userContent = await this.createOrUpdateFile(formattedEntry, archive[refId]?.notes || '');
-				
-				if (archive[refId]) {
+				const { userContent, path } = await this.createOrUpdateFile(
+					formattedEntry,
+					archived?.notes || ''
+				);
+
+				if (archived) {
 					updatedCount++;
 				} else {
 					newCount++;
 				}
 
-				archive[refId] = {
+				archive[rawKey] = {
 					entry: formattedEntry,
-					notes: userContent
+					notes: userContent,
+					hash: rawHash,
+					path
 				};
 			} catch (error) {
-				console.error(`Error processing ${refId}:`, error);
+				errorCount++;
+				console.error(`Paperpile import: error processing ${rawKey}:`, error);
 			}
+
+			// Yield to the event loop in batches so cppgc / V8 GC can run
+			// and other plugins can process file change events incrementally.
+			if (processed % IMPORT_BATCH_SIZE === 0) await this.yieldToEventLoop();
 		}
 
-		// Clean up removed papers
+		// Clean up removed papers (cheap O(removed) using cached path).
 		const movedCount = await this.cleanupRemovedPapers(currentRefIds, archive);
 
-		// Save archive
+		// Save archive (compact, no pretty-printing).
 		await this.saveArchive(archive);
 
-		// Show summary
-		new Notice(`Import complete!\nNew: ${newCount} | Updated: ${updatedCount} | Removed: ${movedCount}`);
+		const summary = [
+			`New: ${newCount}`,
+			`Updated: ${updatedCount}`,
+			`Removed: ${movedCount}`,
+			`Skipped: ${skippedCount}`,
+			errorCount ? `Errors: ${errorCount}` : ''
+		].filter(Boolean).join(' | ');
+		new Notice(`Import complete!\n${summary}`);
+	}
+
+	private yieldToEventLoop(): Promise<void> {
+		return new Promise(resolve => setTimeout(resolve, 0));
+	}
+
+	private async sha1(input: string): Promise<string> {
+		try {
+			const subtle = (globalThis as any)?.crypto?.subtle;
+			if (subtle && typeof subtle.digest === 'function') {
+				const buf = new TextEncoder().encode(input);
+				const hash = await subtle.digest('SHA-1', buf);
+				const bytes = new Uint8Array(hash);
+				let hex = '';
+				for (let i = 0; i < bytes.length; i++) {
+					hex += bytes[i].toString(16).padStart(2, '0');
+				}
+				return hex;
+			}
+		} catch (e) {
+			console.warn('Paperpile import: subtle.digest unavailable, falling back', e);
+		}
+		// Tiny non-cryptographic fallback (DJB2). Hash quality doesn't
+		// matter -- we only need a stable per-entry fingerprint.
+		let h = 5381;
+		for (let i = 0; i < input.length; i++) {
+			h = ((h << 5) + h) ^ input.charCodeAt(i);
+			h = h | 0;
+		}
+		return 'djb2:' + (h >>> 0).toString(16);
 	}
 
 	formatBibEntry(entry: any): FormattedEntry {
@@ -201,35 +294,52 @@ export default class PaperpileImportPlugin extends Plugin {
 		// Remove braces and clean up
 		s = s.replace(/[{}]/g, '');
 		// Remove non-alphanumeric except specific characters
-		s = s.replace(/[^A-Za-z0-9\s&.,-;:/?()\"']+/g, '');
+		s = s.replace(/[^A-Za-z0-9\s&.,\-;:/?()\"']+/g, '');
 		return s.trim().replace(/\s+/g, ' ');
 	}
 
 	formatAuthors(authorString: string): string {
 		if (!authorString) return '';
-		
-		// Replace 'and' with semicolon
-		authorString = authorString.replace(/ and /gi, '; ');
-		
+
+		// Normalize whitespace first so wrapped author lists from BibTeX
+		// don't escape the " and " splitter.
+		authorString = authorString.replace(/\s+/g, ' ').trim();
+
+		// Replace 'and' with semicolon (now safely whitespace-collapsed).
+		authorString = authorString.replace(/\s+and\s+/gi, '; ');
+
 		// Split by semicolon
-		const authors = authorString.split(';').map(a => a.trim());
+		const authors = authorString.split(';').map(a => a.trim()).filter(Boolean);
 		const formatted: string[] = [];
-		
+
 		for (const author of authors) {
 			if (author.includes(',')) {
 				// Format: "Last, First" -> "First Last"
-				const parts = author.split(',').map(p => p.trim());
+				const parts = author.split(',').map(p => p.trim()).filter(Boolean);
 				if (parts.length >= 2) {
 					formatted.push(`${parts[1]} ${parts[0]}`);
-				} else {
-					formatted.push(author);
+				} else if (parts.length === 1) {
+					formatted.push(parts[0]);
 				}
 			} else {
 				formatted.push(author);
 			}
 		}
-		
+
 		return formatted.join(', ');
+	}
+
+	/**
+	 * Sanitize an arbitrary string for safe inclusion as a YAML scalar.
+	 * Collapses internal whitespace (newlines/tabs) and strips control
+	 * characters that would break Obsidian's metadata cache parser.
+	 */
+	sanitizeForYaml(s: string): string {
+		if (!s) return '';
+		return s
+			.replace(/[\u0000-\u001F\u007F]/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim();
 	}
 
 	parsePaperpileFolders(keywords: string): { folders: string[], tags: string[] } {
@@ -262,10 +372,13 @@ export default class PaperpileImportPlugin extends Plugin {
 		return { folders, tags };
 	}
 
-	async createOrUpdateFile(entry: FormattedEntry, existingNotes: string): Promise<string> {
+	async createOrUpdateFile(
+		entry: FormattedEntry,
+		existingNotes: string
+	): Promise<{ userContent: string; path: string }> {
 		const papersFolder = this.getPapersFolder();
 		const filename = `${entry.ref_id}.md`;
-		
+
 		// Determine target folder
 		let targetFolder = papersFolder;
 		if (entry.folders.length > 0) {
@@ -273,29 +386,29 @@ export default class PaperpileImportPlugin extends Plugin {
 			targetFolder = `${papersFolder}/${primaryFolder}`;
 			await this.ensureFolder(targetFolder);
 		}
-		
+
 		const filepath = `${targetFolder}/${filename}`;
-		
+
 		// Check for existing file
 		const existingFile = this.app.vault.getAbstractFileByPath(filepath);
 		let userNotes = existingNotes;
-		
+
 		if (existingFile instanceof TFile) {
 			// Extract user notes from existing file
 			userNotes = await this.extractUserNotes(existingFile);
 		}
-		
+
 		// Create markdown content
 		const content = this.createMarkdownContent(entry, userNotes);
-		
+
 		// Write file
 		if (existingFile instanceof TFile) {
 			await this.app.vault.modify(existingFile, content);
 		} else {
 			await this.app.vault.create(filepath, content);
 		}
-		
-		return userNotes;
+
+		return { userContent: userNotes, path: filepath };
 	}
 
 	async extractUserNotes(file: TFile): Promise<string> {
@@ -316,35 +429,37 @@ export default class PaperpileImportPlugin extends Plugin {
 	}
 
 	createMarkdownContent(entry: FormattedEntry, userNotes: string): string {
+		const yaml = (v: string) => this.escapeYaml(this.sanitizeForYaml(v));
+
 		let content = '---\n';
-		content += `title: "${this.escapeYaml(entry.title)}"\n`;
-		
+		content += `title: "${yaml(entry.title)}"\n`;
+
 		if (entry.authors) {
-			content += `authors: "${this.escapeYaml(entry.authors)}"\n`;
+			content += `authors: "${yaml(entry.authors)}"\n`;
 		}
 		if (entry.year) {
-			content += `year: ${entry.year}\n`;
+			content += `year: ${yaml(entry.year)}\n`;
 		}
 		if (entry.journal) {
-			content += `journal: "${this.escapeYaml(entry.journal)}"\n`;
+			content += `journal: "${yaml(entry.journal)}"\n`;
 		}
 		if (entry.booktitle) {
-			content += `conference: "${this.escapeYaml(entry.booktitle)}"\n`;
+			content += `conference: "${yaml(entry.booktitle)}"\n`;
 		}
 		if (entry.abstract) {
-			content += `abstract: "${this.escapeYaml(entry.abstract)}"\n`;
+			content += `abstract: "${yaml(entry.abstract)}"\n`;
 		}
 		if (entry.link) {
-			content += `url: "${entry.link}"\n`;
+			content += `url: "${yaml(entry.link)}"\n`;
 		}
 		if (entry.doi) {
-			content += `doi: "${entry.doi}"\n`;
+			content += `doi: "${yaml(entry.doi)}"\n`;
 		}
 		if (entry.pdf_path) {
-			content += `pdf: "${entry.pdf_path}"\n`;
+			content += `pdf: "${yaml(entry.pdf_path)}"\n`;
 		}
-		
-		content += `ref_id: "${entry.ref_id}"\n`;
+
+		content += `ref_id: "${yaml(entry.ref_id)}"\n`;
 		
 		// Add tags
 		if (entry.tags.length > 0) {
@@ -398,20 +513,67 @@ export default class PaperpileImportPlugin extends Plugin {
 	}
 
 	escapeYaml(str: string): string {
-		return str.replace(/"/g, '\\"');
+		// Escape backslashes first, then double-quotes. Anything that
+		// reaches here should already have been whitespace-normalized by
+		// sanitizeForYaml(); we still defensively strip control chars.
+		return str
+			.replace(/\\/g, '\\\\')
+			.replace(/"/g, '\\"')
+			.replace(/[\u0000-\u001F\u007F]/g, ' ');
+	}
+
+	/**
+	 * Strip the inline HTML that Paperpile sometimes embeds in the
+	 * `annote` field. Without this, a single entry can ship tens of KB
+	 * of `<p style="...">` tags which inflate every rendered DOM tree
+	 * and contributed to the cppgc OOM that crashed the renderer.
+	 */
+	private stripHtml(input: string): string {
+		if (!input) return '';
+		return input
+			// Convert common block close tags to newlines so paragraph
+			// structure survives the strip.
+			.replace(/<\s*br\s*\/?\s*>/gi, '\n')
+			.replace(/<\s*\/(p|div|h[1-6]|li|tr|blockquote)\s*>/gi, '\n')
+			// Drop everything else.
+			.replace(/<[^>]+>/g, '')
+			// Common HTML entities.
+			.replace(/&nbsp;/gi, ' ')
+			.replace(/&amp;/gi, '&')
+			.replace(/&lt;/gi, '<')
+			.replace(/&gt;/gi, '>')
+			.replace(/&quot;/gi, '"')
+			.replace(/&#39;/gi, "'")
+			// Zero-width / BOM characters Paperpile sometimes injects.
+			.replace(/[\u200B-\u200F\uFEFF]/g, '')
+			// Collapse runs of more than 2 newlines.
+			.replace(/\n{3,}/g, '\n\n');
 	}
 
 	formatPaperpileNotes(notes: string): string {
 		if (!notes) return '';
-		
+
+		// 1. Strip embedded HTML so we don't write thousands of inline
+		//    DOM nodes into the markdown body.
+		let cleaned = this.stripHtml(notes);
+
+		// 2. Cap absurdly large notes. Paperpile occasionally exports
+		//    huge HTML dumps in `annote`; truncating prevents a single
+		//    entry from dominating renderer memory.
+		if (cleaned.length > MAX_PAPERPILE_NOTES_BYTES) {
+			cleaned = cleaned.slice(0, MAX_PAPERPILE_NOTES_BYTES) +
+				`\n\n_… (truncated by Paperpile import; original was ` +
+				`${cleaned.length.toLocaleString()} chars)_`;
+		}
+
 		// Split into lines and process
-		const lines = notes.split('\n');
+		const lines = cleaned.split('\n');
 		const formatted: string[] = [];
 		let inParagraph = false;
-		
+
 		for (let i = 0; i < lines.length; i++) {
 			let line = lines[i].trim();
-			
+
 			// Empty line - preserve as paragraph break
 			if (!line) {
 				if (inParagraph) {
@@ -420,14 +582,14 @@ export default class PaperpileImportPlugin extends Plugin {
 				}
 				continue;
 			}
-			
+
 			// Check if it's a heading (no quotes, title case, relatively short, not ending with period)
 			if (this.isHeadingLine(line)) {
 				if (inParagraph) formatted.push(''); // Add space before heading
 				formatted.push(`#### ${line}`);
 				formatted.push(''); // Add space after heading
 				inParagraph = false;
-			} 
+			}
 			// Check if it's a quote (starts with ")
 			else if (line.startsWith('"')) {
 				// It's a quote - format as blockquote
@@ -445,7 +607,7 @@ export default class PaperpileImportPlugin extends Plugin {
 				inParagraph = true;
 			}
 		}
-		
+
 		return formatted.join('\n');
 	}
 
@@ -500,8 +662,10 @@ export default class PaperpileImportPlugin extends Plugin {
 
 	async saveArchive(archive: Archive) {
 		const archivePath = this.settings.archiveFile;
-		const content = JSON.stringify(archive, null, 2);
-		
+		// Compact serialization: pretty-printing roughly doubles peak
+		// memory for large archives and provides no runtime benefit.
+		const content = JSON.stringify(archive);
+
 		const file = this.app.vault.getAbstractFileByPath(archivePath);
 		if (file instanceof TFile) {
 			await this.app.vault.modify(file, content);
@@ -513,30 +677,51 @@ export default class PaperpileImportPlugin extends Plugin {
 	async cleanupRemovedPapers(currentRefIds: Set<string>, archive: Archive): Promise<number> {
 		const papersFolder = this.getPapersFolder();
 		const removedFolder = `${papersFolder}/Removed Papers`;
-		await this.ensureFolder(removedFolder);
-		
+
 		let movedCount = 0;
-		
+		let ensuredRemovedFolder = false;
+
 		for (const refId in archive) {
-			if (!currentRefIds.has(refId)) {
-				// Find and move the file
+			if (currentRefIds.has(refId)) continue;
+
+			const record = archive[refId];
+			let file: TFile | null = null;
+
+			// Fast path: the archive remembers the original path of the
+			// generated file, so we can resolve it directly instead of
+			// recursively scanning the entire Papers tree.
+			if (record?.path) {
+				const maybe = this.app.vault.getAbstractFileByPath(record.path);
+				if (maybe instanceof TFile) file = maybe;
+			}
+
+			// Fallback for archive entries written by older versions of
+			// the plugin that didn't store a path.
+			if (!file) {
 				const filename = `${refId}.md`;
 				const folder = this.app.vault.getAbstractFileByPath(papersFolder);
-				
 				if (folder instanceof TFolder) {
-					// Search for file recursively
-					const file = this.findFileRecursive(folder, filename);
-					if (file && file.parent?.path !== removedFolder) {
-						const newPath = `${removedFolder}/${file.name}`;
-						await this.app.fileManager.renameFile(file, newPath);
-						movedCount++;
-					}
+					file = this.findFileRecursive(folder, filename);
 				}
-				
-				delete archive[refId];
 			}
+
+			if (file && file.parent?.path !== removedFolder) {
+				if (!ensuredRemovedFolder) {
+					await this.ensureFolder(removedFolder);
+					ensuredRemovedFolder = true;
+				}
+				try {
+					const newPath = `${removedFolder}/${file.name}`;
+					await this.app.fileManager.renameFile(file, newPath);
+					movedCount++;
+				} catch (e) {
+					console.error(`Paperpile import: failed to move ${refId}:`, e);
+				}
+			}
+
+			delete archive[refId];
 		}
-		
+
 		return movedCount;
 	}
 
